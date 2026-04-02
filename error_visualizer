@@ -1,0 +1,651 @@
+import { useState, useCallback, useRef } from "react";
+
+// ─── LOCAL ERROR PARSER ENGINE ──────────────────────────────────────────────
+const ERROR_PATTERNS = [
+  {
+    type: "Python Traceback",
+    emoji: "🐍",
+    color: "#00d4aa",
+    bg: "#001a15",
+    detect: (t) => /traceback \(most recent call last\)/i.test(t),
+    severity: (t) => {
+      if (/memoryerror|recursionerror|systemexit/i.test(t)) return "critical";
+      if (/importerror|modulenotfounderror/i.test(t)) return "high";
+      if (/typeerror|valueerror|attributeerror/i.test(t)) return "medium";
+      return "low";
+    },
+    parse: (t) => {
+      const lines = t.split("\n");
+      const errorLine = lines.find((l) => /^[A-Za-z]+Error:|^[A-Za-z]+Exception:/.test(l.trim())) || lines[lines.length - 1];
+      const fileLines = [...t.matchAll(/File "([^"]+)", line (\d+)/g)].map((m) => ({ file: m[1], line: m[2] }));
+      const errorType = errorLine?.match(/^([A-Za-z]+(?:Error|Exception|Warning))/)?.[1] || "Error";
+      const errorMsg = errorLine?.replace(/^[^:]+:/, "").trim() || "Unknown error";
+      return {
+        errorType,
+        errorMsg,
+        callStack: fileLines,
+        rootCause: fileLines[fileLines.length - 1] || null,
+        suggestions: getSuggestions(errorType, t),
+        flow: buildPythonFlow(errorType, fileLines, errorMsg),
+      };
+    },
+  },
+  {
+    type: "JavaScript Error",
+    emoji: "🟨",
+    color: "#f7df1e",
+    bg: "#1a1a00",
+    detect: (t) => /typeerror:|referenceerror:|syntaxerror:|rangeerror:|uncaught/i.test(t),
+    severity: (t) => {
+      if (/cannot read prop|undefined is not/i.test(t)) return "high";
+      if (/syntaxerror/i.test(t)) return "medium";
+      return "low";
+    },
+    parse: (t) => {
+      const errorMatch = t.match(/(TypeError|ReferenceError|SyntaxError|RangeError|URIError|EvalError)[:\s]+([^\n]+)/i);
+      const atLines = [...t.matchAll(/at (.+?) \((.+?):(\d+):(\d+)\)/g)].map((m) => ({ fn: m[1], file: m[2], line: m[3], col: m[4] }));
+      const errorType = errorMatch?.[1] || "Error";
+      const errorMsg = errorMatch?.[2]?.trim() || t.split("\n")[0];
+      return {
+        errorType,
+        errorMsg,
+        callStack: atLines.map((a) => ({ file: `${a.file}:${a.line}`, line: a.line, fn: a.fn })),
+        rootCause: atLines[0] || null,
+        suggestions: getSuggestions(errorType, t),
+        flow: buildJSFlow(errorType, atLines, errorMsg),
+      };
+    },
+  },
+  {
+    type: "Java Exception",
+    emoji: "☕",
+    color: "#ff6b35",
+    bg: "#1a0a00",
+    detect: (t) => /exception in thread|java\.|\.java:\d+/i.test(t),
+    severity: (t) => {
+      if (/nullpointerexception|outofmemoryerror/i.test(t)) return "critical";
+      if (/classnotfoundexception|nosuchmethodexception/i.test(t)) return "high";
+      return "medium";
+    },
+    parse: (t) => {
+      const exMatch = t.match(/Exception in thread "[^"]*" ([^\n]+)/i);
+      const atLines = [...t.matchAll(/at ([\w$.]+)\(([^:)]+):?(\d+)?\)/g)].map((m) => ({ file: m[2], line: m[3] || "?", fn: m[1] }));
+      const errorType = t.match(/([\w.]+Exception|[\w.]+Error)/)?.[1]?.split(".").pop() || "Exception";
+      const errorMsg = exMatch?.[1]?.split(":").slice(1).join(":").trim() || t.split("\n")[0];
+      return {
+        errorType,
+        errorMsg,
+        callStack: atLines,
+        rootCause: atLines[0] || null,
+        suggestions: getSuggestions(errorType, t),
+        flow: buildJavaFlow(errorType, atLines, errorMsg),
+      };
+    },
+  },
+  {
+    type: "HTTP Error",
+    emoji: "🌐",
+    color: "#ff4757",
+    bg: "#1a0005",
+    detect: (t) => /\b(4\d{2}|5\d{2})\b.*(error|not found|forbidden|unauthorized|server)/i.test(t) || /http\/\d/i.test(t),
+    severity: (t) => {
+      if (/500|502|503|504/i.test(t)) return "critical";
+      if (/401|403/i.test(t)) return "high";
+      if (/404/i.test(t)) return "medium";
+      return "low";
+    },
+    parse: (t) => {
+      const codeMatch = t.match(/\b([45]\d{2})\b/);
+      const code = codeMatch?.[1] || "???";
+      const httpErrors = {
+        400: "Bad Request — malformed syntax", 401: "Unauthorized — auth required",
+        403: "Forbidden — no permission", 404: "Not Found — resource missing",
+        405: "Method Not Allowed", 429: "Too Many Requests — rate limited",
+        500: "Internal Server Error", 502: "Bad Gateway — upstream failure",
+        503: "Service Unavailable", 504: "Gateway Timeout",
+      };
+      const errorMsg = httpErrors[code] || `HTTP ${code} Error`;
+      return {
+        errorType: `HTTP ${code}`,
+        errorMsg,
+        callStack: [],
+        rootCause: null,
+        suggestions: getHTTPSuggestions(code),
+        flow: buildHTTPFlow(code, errorMsg),
+      };
+    },
+  },
+  {
+    type: "SQL Error",
+    emoji: "🗄️",
+    color: "#a29bfe",
+    bg: "#0d0a1a",
+    detect: (t) => /sql|syntax error near|ORA-|mysql|postgres|sqlite/i.test(t),
+    severity: (t) => {
+      if (/injection|drop table|xp_cmdshell/i.test(t)) return "critical";
+      if (/deadlock|timeout|connection refused/i.test(t)) return "high";
+      return "medium";
+    },
+    parse: (t) => {
+      const isInjection = /(\bor\b.*=.*|union select|drop table|--|xp_cmdshell)/i.test(t);
+      const errMatch = t.match(/(ORA-\d+|Error \d+|ERROR:)[^\n]*/i);
+      const errorType = isInjection ? "SQL Injection Detected" : "SQL Syntax Error";
+      const errorMsg = errMatch?.[0] || t.split("\n")[0];
+      return {
+        errorType,
+        errorMsg,
+        callStack: [],
+        rootCause: null,
+        suggestions: isInjection
+          ? ["🔐 Use parameterized queries immediately", "🚫 Never concatenate user input into SQL", "🛡️ Add input sanitization layer", "📋 Audit all DB access points"]
+          : ["✅ Check SQL syntax with a validator", "📖 Verify table/column names exist", "🔍 Check for missing quotes or semicolons"],
+        flow: buildSQLFlow(errorType, isInjection),
+        isSecurityRisk: isInjection,
+      };
+    },
+  },
+];
+
+function getSuggestions(errorType, text) {
+  const map = {
+    TypeError: ["🔍 Check variable types before usage", "✅ Add null/undefined guards", "📖 Verify function signatures", "🧪 Add type checking or TypeScript"],
+    ValueError: ["📏 Validate input ranges before processing", "🔍 Check data format expectations", "✅ Add input validation at boundaries"],
+    ImportError: ["📦 Run `pip install <module>`", "🔍 Check virtual environment is activated", "📁 Verify module path is correct"],
+    ModuleNotFoundError: ["📦 Install missing package", "🔍 Check spelling of module name", "🌐 Verify package exists on PyPI"],
+    AttributeError: ["🔍 Check object type before accessing attribute", "📖 Verify attribute name spelling", "✅ Use `hasattr()` to check first"],
+    NullPointerException: ["✅ Add null checks before object access", "🛡️ Use Optional<T> in Java 8+", "🔍 Trace where null value originates"],
+    ReferenceError: ["📖 Check variable is declared before use", "🔍 Verify scope — variable may be out of scope", "✅ Use `let`/`const` over `var`"],
+    SyntaxError: ["🔍 Check for missing brackets, quotes, or semicolons", "📋 Use a linter (ESLint, Pylint)", "✏️ Check indentation (Python)"],
+    OutOfMemoryError: ["🧹 Reduce data loaded into memory", "📊 Use streaming/pagination for large datasets", "⚙️ Increase JVM heap with -Xmx flag"],
+  };
+  for (const [key, suggestions] of Object.entries(map)) {
+    if (new RegExp(key, "i").test(errorType + text)) return suggestions;
+  }
+  return ["🔍 Read the error message carefully", "🌐 Search the error on Stack Overflow", "🧪 Add logging around the failure point", "📖 Check documentation for expected behavior"];
+}
+
+function getHTTPSuggestions(code) {
+  const map = {
+    400: ["✅ Validate request body/params before sending", "📖 Check API documentation for required fields"],
+    401: ["🔑 Include Authorization header", "🔄 Refresh expired token", "📝 Check API key is valid"],
+    403: ["🔐 Check user role/permissions", "🌐 Verify CORS settings", "🔑 Check resource ownership"],
+    404: ["📁 Verify URL path is correct", "🔄 Check if resource was deleted/moved", "📖 Read API docs for correct endpoint"],
+    429: ["⏱️ Implement exponential backoff", "📊 Reduce request frequency", "🔑 Check rate limit headers"],
+    500: ["🔍 Check server logs for root cause", "🔄 Retry the request", "📞 Contact API provider if persistent"],
+    503: ["⏱️ Server is down — wait and retry", "📊 Check service status page", "🔄 Implement retry with backoff"],
+  };
+  return map[code] || ["🔍 Check request and response details", "📖 Consult API documentation"];
+}
+
+function buildPythonFlow(errorType, stack, msg) {
+  return [
+    { id: 1, label: "🚀 Program Start", type: "start" },
+    ...stack.slice(0, 3).map((s, i) => ({ id: i + 2, label: `📄 ${s.file?.split("/").pop()}\nLine ${s.line}`, type: "step" })),
+    { id: stack.length + 2, label: `💥 ${errorType}\n${msg?.slice(0, 40)}`, type: "error" },
+    { id: stack.length + 3, label: "🔧 Apply Fix", type: "fix" },
+  ];
+}
+
+function buildJSFlow(errorType, atLines, msg) {
+  return [
+    { id: 1, label: "🌐 Browser/Node Start", type: "start" },
+    ...atLines.slice(0, 3).map((a, i) => ({ id: i + 2, label: `⚙️ ${a.fn}\n${a.file?.split("/").pop()}:${a.line}`, type: "step" })),
+    { id: atLines.length + 2, label: `💥 ${errorType}\n${msg?.slice(0, 40)}`, type: "error" },
+    { id: atLines.length + 3, label: "🔧 Apply Fix", type: "fix" },
+  ];
+}
+
+function buildJavaFlow(errorType, atLines, msg) {
+  return [
+    { id: 1, label: "☕ JVM Starts", type: "start" },
+    ...atLines.slice(0, 3).map((a, i) => ({ id: i + 2, label: `📦 ${a.fn?.split(".").pop()}\n${a.file}:${a.line}`, type: "step" })),
+    { id: atLines.length + 2, label: `💥 ${errorType}\n${msg?.slice(0, 40)}`, type: "error" },
+    { id: atLines.length + 3, label: "🔧 Apply Fix", type: "fix" },
+  ];
+}
+
+function buildHTTPFlow(code, msg) {
+  const isServer = parseInt(code) >= 500;
+  return [
+    { id: 1, label: "📤 Client Sends Request", type: "start" },
+    { id: 2, label: isServer ? "🖥️ Server Processes" : "🌐 Server Receives", type: "step" },
+    { id: 3, label: isServer ? "💥 Server Failure" : "🚫 Request Rejected", type: "error" },
+    { id: 4, label: `HTTP ${code}\n${msg}`, type: "error" },
+    { id: 5, label: "🔧 Fix & Retry", type: "fix" },
+  ];
+}
+
+function buildSQLFlow(errorType, isInjection) {
+  if (isInjection) {
+    return [
+      { id: 1, label: "👤 User Input", type: "start" },
+      { id: 2, label: "💉 Malicious Payload\nInjected into Query", type: "error" },
+      { id: 3, label: "🗄️ DB Executes\nAttacker's SQL", type: "error" },
+      { id: 4, label: "💀 Data Breach /\nDB Corrupted", type: "critical" },
+      { id: 5, label: "🛡️ Use Parameterized\nQueries", type: "fix" },
+    ];
+  }
+  return [
+    { id: 1, label: "📝 SQL Query Written", type: "start" },
+    { id: 2, label: "🗄️ DB Parser Reads Query", type: "step" },
+    { id: 3, label: "💥 Syntax Error\nFound", type: "error" },
+    { id: 4, label: "🔧 Fix Query Syntax", type: "fix" },
+  ];
+}
+
+// ─── SEVERITY CONFIG ─────────────────────────────────────────────────────────
+const SEVERITY = {
+  critical: { label: "💀 CRITICAL", color: "#ff2d55", bg: "#2d0010", glow: "#ff2d55" },
+  high:     { label: "🔴 HIGH",     color: "#ff6b35", bg: "#2d1000", glow: "#ff6b35" },
+  medium:   { label: "🟡 MEDIUM",   color: "#ffd32a", bg: "#2d2700", glow: "#ffd32a" },
+  low:      { label: "🟢 LOW",      color: "#2ed573", bg: "#002d10", glow: "#2ed573" },
+};
+
+// ─── FLOWCHART SVG ───────────────────────────────────────────────────────────
+function FlowChart({ nodes }) {
+  if (!nodes || nodes.length === 0) return null;
+  const W = 220, H = 70, GAP = 30, TOTAL_H = nodes.length * (H + GAP);
+  const colors = { start: "#00d4aa", step: "#4a9eff", error: "#ff4757", critical: "#ff2d55", fix: "#2ed573" };
+  const shapes = { start: "rounded", step: "rect", error: "diamond", critical: "diamond", fix: "rounded" };
+
+  return (
+    <svg width={W + 60} height={TOTAL_H + 40} style={{ display: "block", margin: "0 auto" }}>
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L0,6 L8,3 z" fill="#555" />
+        </marker>
+        {Object.entries(colors).map(([k, c]) => (
+          <filter key={k} id={`glow-${k}`}>
+            <feGaussianBlur stdDeviation="3" result="blur" />
+            <feFlood floodColor={c} floodOpacity="0.6" result="color" />
+            <feComposite in="color" in2="blur" operator="in" result="shadow" />
+            <feMerge><feMergeNode in="shadow" /><feMergeNode in="SourceGraphic" /></feMerge>
+          </filter>
+        ))}
+      </defs>
+      {nodes.map((node, i) => {
+        const x = 30, y = 20 + i * (H + GAP);
+        const cx = x + W / 2, cy = y + H / 2;
+        const color = colors[node.type] || "#888";
+        const isError = node.type === "error" || node.type === "critical";
+        const lines = node.label.split("\n");
+
+        return (
+          <g key={node.id}>
+            {i < nodes.length - 1 && (
+              <line x1={cx} y1={y + H} x2={cx} y2={y + H + GAP} stroke="#444" strokeWidth="2" markerEnd="url(#arrow)" />
+            )}
+            <rect
+              x={x} y={y} width={W} height={H}
+              rx={node.type === "start" || node.type === "fix" ? 35 : 8}
+              fill={isError ? `${color}22` : "#0d0d0d"}
+              stroke={color} strokeWidth={isError ? 2 : 1.5}
+              filter={`url(#glow-${node.type})`}
+            />
+            {lines.map((line, li) => (
+              <text key={li} x={cx} y={cy + (li - (lines.length - 1) / 2) * 18}
+                textAnchor="middle" dominantBaseline="middle"
+                fill={color} fontSize={li === 0 ? 13 : 10} fontFamily="monospace" fontWeight={li === 0 ? "bold" : "normal"}>
+                {line.length > 28 ? line.slice(0, 28) + "…" : line}
+              </text>
+            ))}
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+// ─── SEVERITY GAUGE ──────────────────────────────────────────────────────────
+function SeverityGauge({ level }) {
+  const levels = ["low", "medium", "high", "critical"];
+  const idx = levels.indexOf(level);
+  return (
+    <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+      {levels.map((l, i) => (
+        <div key={l} style={{
+          height: 8 + i * 4, width: 18,
+          borderRadius: 3,
+          background: i <= idx ? SEVERITY[l].color : "#222",
+          boxShadow: i <= idx ? `0 0 8px ${SEVERITY[l].color}` : "none",
+          transition: "all 0.3s ease",
+        }} />
+      ))}
+      <span style={{ color: SEVERITY[level].color, fontFamily: "monospace", fontWeight: "bold", fontSize: 13, marginLeft: 6 }}>
+        {SEVERITY[level].label}
+      </span>
+    </div>
+  );
+}
+
+// ─── CALL STACK TABLE ────────────────────────────────────────────────────────
+function CallStack({ stack }) {
+  if (!stack || stack.length === 0) return null;
+  return (
+    <div style={{ marginTop: 16 }}>
+      <div style={{ color: "#888", fontSize: 11, fontFamily: "monospace", marginBottom: 8, letterSpacing: 2, textTransform: "uppercase" }}>📚 Call Stack</div>
+      <div style={{ border: "1px solid #222", borderRadius: 8, overflow: "hidden" }}>
+        {stack.slice(0, 8).map((s, i) => (
+          <div key={i} style={{
+            display: "flex", gap: 12, padding: "8px 14px",
+            background: i === stack.length - 1 ? "#1a0505" : i % 2 === 0 ? "#0a0a0a" : "#080808",
+            borderBottom: i < stack.length - 1 ? "1px solid #1a1a1a" : "none",
+            fontFamily: "monospace", fontSize: 12,
+          }}>
+            <span style={{ color: "#444", minWidth: 20 }}>#{i + 1}</span>
+            <span style={{ color: i === stack.length - 1 ? "#ff4757" : "#4a9eff", flex: 1 }}>
+              {s.fn ? `${s.fn}()` : ""}
+            </span>
+            <span style={{ color: "#666" }}>{s.file?.split("/").pop() || s.file}</span>
+            <span style={{ color: "#888" }}>:{s.line}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── MAIN APP ────────────────────────────────────────────────────────────────
+export default function ErrorVisualizer() {
+  const [input, setInput] = useState("");
+  const [result, setResult] = useState(null);
+  const [dragOver, setDragOver] = useState(false);
+  const [activeTab, setActiveTab] = useState("flow");
+  const [analyzed, setAnalyzed] = useState(false);
+  const fileRef = useRef();
+
+  const analyze = useCallback((text) => {
+    const normalized = text.trim();
+    if (!normalized) return;
+    for (const pattern of ERROR_PATTERNS) {
+      if (pattern.detect(normalized)) {
+        const parsed = pattern.parse(normalized);
+        const sev = pattern.severity(normalized);
+        setResult({ ...pattern, ...parsed, severity: sev, raw: normalized });
+        setAnalyzed(true);
+        setActiveTab("flow");
+        return;
+      }
+    }
+    // Generic fallback
+    setResult({
+      type: "Unknown Error", emoji: "⚠️", color: "#ffd32a", bg: "#1a1500",
+      errorType: "Generic Error", errorMsg: normalized.split("\n")[0],
+      severity: "low", callStack: [], suggestions: getSuggestions("", normalized),
+      flow: [
+        { id: 1, label: "🔍 Error Detected", type: "start" },
+        { id: 2, label: `⚠️ ${normalized.split("\n")[0].slice(0, 40)}`, type: "error" },
+        { id: 3, label: "🔧 Debug & Fix", type: "fix" },
+      ],
+      raw: normalized,
+    });
+    setAnalyzed(true);
+    setActiveTab("flow");
+  }, []);
+
+  const handleFile = (file) => {
+    const reader = new FileReader();
+    reader.onload = (e) => { setInput(e.target.result); analyze(e.target.result); };
+    reader.readAsText(file);
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault(); setDragOver(false);
+    const file = e.dataTransfer.files[0];
+    if (file) handleFile(file);
+  };
+
+  const reset = () => { setInput(""); setResult(null); setAnalyzed(false); };
+
+  const tabs = [
+    { id: "flow", label: "🗺️ Flowchart" },
+    { id: "stack", label: "📚 Call Stack" },
+    { id: "fix", label: "🔧 Fix Guide" },
+    { id: "raw", label: "📄 Raw Error" },
+  ];
+
+  return (
+    <div style={{
+      minHeight: "100vh", background: "#050505",
+      fontFamily: "'Courier New', monospace", color: "#e0e0e0",
+      backgroundImage: "radial-gradient(ellipse at 20% 50%, #0a1a0a 0%, transparent 60%), radial-gradient(ellipse at 80% 20%, #0a0a1a 0%, transparent 60%)",
+    }}>
+      {/* Header */}
+      <div style={{ borderBottom: "1px solid #1a1a1a", padding: "20px 32px", display: "flex", alignItems: "center", gap: 16,
+        background: "linear-gradient(90deg, #050505, #0a0a0a)" }}>
+        <div style={{ fontSize: 28 }}>🔬</div>
+        <div>
+          <div style={{ fontSize: 20, fontWeight: "bold", letterSpacing: 3, color: "#fff",
+            textShadow: "0 0 20px rgba(0,212,170,0.5)" }}>
+            ERROR<span style={{ color: "#00d4aa" }}>SCOPE</span>
+          </div>
+          <div style={{ fontSize: 10, color: "#555", letterSpacing: 4, textTransform: "uppercase" }}>
+            Offline Error Visualizer • No API • No Data Sent
+          </div>
+        </div>
+        <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+          {["🔒 Private", "📡 Offline", "⚡ Instant"].map(tag => (
+            <span key={tag} style={{ fontSize: 10, padding: "4px 10px", borderRadius: 20, border: "1px solid #2a2a2a",
+              color: "#666", letterSpacing: 1 }}>{tag}</span>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ display: "flex", minHeight: "calc(100vh - 70px)" }}>
+        {/* Left Panel */}
+        <div style={{ width: analyzed ? "380px" : "100%", transition: "width 0.4s ease", padding: 24,
+          borderRight: analyzed ? "1px solid #1a1a1a" : "none", display: "flex", flexDirection: "column", gap: 16 }}>
+
+          {/* Drop Zone */}
+          <div
+            onDrop={handleDrop} onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+            onDragLeave={() => setDragOver(false)}
+            onClick={() => fileRef.current.click()}
+            style={{
+              border: `2px dashed ${dragOver ? "#00d4aa" : "#2a2a2a"}`,
+              borderRadius: 12, padding: "20px", textAlign: "center", cursor: "pointer",
+              background: dragOver ? "#001a15" : "#080808",
+              transition: "all 0.2s ease",
+              boxShadow: dragOver ? "0 0 30px rgba(0,212,170,0.2)" : "none",
+            }}>
+            <input ref={fileRef} type="file" accept=".txt,.log,.err,.py,.js,.java" style={{ display: "none" }}
+              onChange={(e) => e.target.files[0] && handleFile(e.target.files[0])} />
+            <div style={{ fontSize: 28, marginBottom: 8 }}>📁</div>
+            <div style={{ color: "#555", fontSize: 12 }}>Drop log/error file or click to upload</div>
+            <div style={{ color: "#333", fontSize: 10, marginTop: 4 }}>.txt · .log · .err · .py · .js · .java</div>
+          </div>
+
+          {/* Textarea */}
+          <div style={{ position: "relative" }}>
+            <textarea
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              placeholder={`Paste your error here...\n\nExamples:\n• Python Traceback\n• JavaScript TypeError\n• Java NullPointerException\n• HTTP 404/500 error\n• SQL syntax error`}
+              style={{
+                width: "100%", minHeight: analyzed ? 260 : 380, background: "#080808",
+                border: "1px solid #1e1e1e", borderRadius: 10, color: "#ccc",
+                fontFamily: "monospace", fontSize: 12, padding: 16, resize: "vertical",
+                outline: "none", lineHeight: 1.6, boxSizing: "border-box",
+                transition: "border-color 0.2s",
+              }}
+              onFocus={(e) => e.target.style.borderColor = "#2a2a2a"}
+            />
+          </div>
+
+          {/* Buttons */}
+          <div style={{ display: "flex", gap: 10 }}>
+            <button
+              onClick={() => analyze(input)}
+              style={{
+                flex: 1, padding: "12px", borderRadius: 8, border: "none",
+                background: "linear-gradient(135deg, #00d4aa, #0099ff)",
+                color: "#000", fontWeight: "bold", fontSize: 13, cursor: "pointer",
+                fontFamily: "monospace", letterSpacing: 1, transition: "opacity 0.2s",
+              }}
+              onMouseOver={(e) => e.target.style.opacity = "0.85"}
+              onMouseOut={(e) => e.target.style.opacity = "1"}>
+              🔬 ANALYZE
+            </button>
+            {analyzed && (
+              <button onClick={reset} style={{
+                padding: "12px 18px", borderRadius: 8, border: "1px solid #2a2a2a",
+                background: "transparent", color: "#666", cursor: "pointer", fontFamily: "monospace", fontSize: 12,
+              }}>✕ Reset</button>
+            )}
+          </div>
+
+          {/* Supported Types */}
+          {!analyzed && (
+            <div style={{ marginTop: 8 }}>
+              <div style={{ color: "#333", fontSize: 10, letterSpacing: 2, marginBottom: 10, textTransform: "uppercase" }}>
+                Supported Error Types
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                {ERROR_PATTERNS.map(p => (
+                  <div key={p.type} style={{
+                    padding: "6px 12px", borderRadius: 20, border: `1px solid ${p.color}33`,
+                    color: p.color, fontSize: 11, background: `${p.color}0a`,
+                  }}>
+                    {p.emoji} {p.type}
+                  </div>
+                ))}
+                <div style={{ padding: "6px 12px", borderRadius: 20, border: "1px solid #ffd32a33",
+                  color: "#ffd32a", fontSize: 11, background: "#ffd32a0a" }}>⚠️ Generic Error</div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Right Panel - Results */}
+        {analyzed && result && (
+          <div style={{ flex: 1, padding: 24, overflowY: "auto", display: "flex", flexDirection: "column", gap: 20 }}>
+
+            {/* Error Header Card */}
+            <div style={{
+              padding: 20, borderRadius: 14, border: `1px solid ${result.color}33`,
+              background: `linear-gradient(135deg, ${result.bg}, #050505)`,
+              boxShadow: `0 0 40px ${result.color}15`,
+            }}>
+              <div style={{ display: "flex", alignItems: "flex-start", gap: 16 }}>
+                <div style={{ fontSize: 44, lineHeight: 1 }}>{result.emoji}</div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 8 }}>
+                    <span style={{ color: result.color, fontSize: 14, fontWeight: "bold", letterSpacing: 2 }}>
+                      {result.type}
+                    </span>
+                    {result.isSecurityRisk && (
+                      <span style={{ padding: "2px 10px", borderRadius: 20, background: "#ff2d5522",
+                        border: "1px solid #ff2d55", color: "#ff2d55", fontSize: 10, letterSpacing: 1 }}>
+                        🚨 SECURITY RISK
+                      </span>
+                    )}
+                  </div>
+                  <div style={{ fontSize: 18, fontWeight: "bold", color: "#fff", marginBottom: 8 }}>
+                    {result.errorType}
+                  </div>
+                  <div style={{ color: "#aaa", fontSize: 13, lineHeight: 1.5, marginBottom: 12 }}>
+                    {result.errorMsg?.slice(0, 120)}{result.errorMsg?.length > 120 ? "…" : ""}
+                  </div>
+                  <SeverityGauge level={result.severity} />
+                </div>
+              </div>
+            </div>
+
+            {/* Tabs */}
+            <div style={{ display: "flex", gap: 4, borderBottom: "1px solid #1a1a1a", paddingBottom: 0 }}>
+              {tabs.map(tab => (
+                <button key={tab.id} onClick={() => setActiveTab(tab.id)} style={{
+                  padding: "8px 16px", background: "none", border: "none", cursor: "pointer",
+                  color: activeTab === tab.id ? result.color : "#555",
+                  fontFamily: "monospace", fontSize: 12, letterSpacing: 1,
+                  borderBottom: activeTab === tab.id ? `2px solid ${result.color}` : "2px solid transparent",
+                  transition: "all 0.2s", marginBottom: -1,
+                }}>
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+
+            {/* Tab Content */}
+            <div>
+              {activeTab === "flow" && (
+                <div>
+                  <div style={{ color: "#555", fontSize: 11, letterSpacing: 2, textTransform: "uppercase", marginBottom: 16 }}>
+                    Error Execution Flow
+                  </div>
+                  <FlowChart nodes={result.flow} />
+                </div>
+              )}
+
+              {activeTab === "stack" && (
+                result.callStack?.length > 0
+                  ? <CallStack stack={result.callStack} />
+                  : <div style={{ color: "#444", fontFamily: "monospace", fontSize: 13, padding: 20, textAlign: "center" }}>
+                      No call stack data found for this error type.
+                    </div>
+              )}
+
+              {activeTab === "fix" && (
+                <div>
+                  <div style={{ color: "#555", fontSize: 11, letterSpacing: 2, textTransform: "uppercase", marginBottom: 16 }}>
+                    Suggested Fixes
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                    {result.suggestions?.map((s, i) => (
+                      <div key={i} style={{
+                        padding: "14px 18px", borderRadius: 8, background: "#0a0a0a",
+                        border: "1px solid #1e1e1e", fontSize: 13, color: "#ccc",
+                        display: "flex", gap: 12, alignItems: "flex-start",
+                        borderLeft: `3px solid ${result.color}`,
+                      }}>
+                        <span style={{ color: "#555", fontSize: 11, marginTop: 2, minWidth: 20 }}>#{i + 1}</span>
+                        <span>{s}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {activeTab === "raw" && (
+                <div>
+                  <div style={{ color: "#555", fontSize: 11, letterSpacing: 2, textTransform: "uppercase", marginBottom: 16 }}>
+                    Raw Error Input
+                  </div>
+                  <pre style={{
+                    background: "#080808", border: "1px solid #1e1e1e", borderRadius: 8,
+                    padding: 16, color: "#888", fontSize: 11, overflow: "auto",
+                    lineHeight: 1.8, whiteSpace: "pre-wrap", wordBreak: "break-word",
+                    maxHeight: 400,
+                  }}>
+                    {result.raw}
+                  </pre>
+                </div>
+              )}
+            </div>
+
+            {/* Root Cause Pin */}
+            {result.rootCause && (
+              <div style={{
+                padding: 16, borderRadius: 10, background: "#0d0505",
+                border: "1px solid #ff475733", display: "flex", gap: 14, alignItems: "center",
+              }}>
+                <div style={{ fontSize: 24 }}>📍</div>
+                <div>
+                  <div style={{ color: "#ff4757", fontSize: 11, letterSpacing: 2, textTransform: "uppercase", marginBottom: 4 }}>
+                    Root Cause Location
+                  </div>
+                  <div style={{ fontFamily: "monospace", fontSize: 13, color: "#ccc" }}>
+                    {result.rootCause.fn && <span style={{ color: "#4a9eff" }}>{result.rootCause.fn}()</span>}
+                    {result.rootCause.fn && " · "}
+                    <span style={{ color: "#888" }}>{result.rootCause.file}</span>
+                    <span style={{ color: "#555" }}> :{result.rootCause.line}</span>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
